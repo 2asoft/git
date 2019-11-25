@@ -10,6 +10,14 @@
 #include "unpack-trees.h"
 #include "dir.h"
 
+#ifndef DEFAULT_FORMAT_TAG
+#define DEFAULT_FORMAT_TAG "$Format"
+#endif
+
+#ifndef DEFAULT_FORMAT_STRING
+#define DEFAULT_FORMAT_STRING ""
+#endif
+
 static char const * const archive_usage[] = {
 	N_("git archive [<options>] <tree-ish> [<path>...]"),
 	N_("git archive --list"),
@@ -35,6 +43,38 @@ void init_archivers(void)
 	init_zip_archiver();
 }
 
+void get_format_tag(struct strbuf *out)
+{
+	const char *config_value = NULL;
+	git_config_get_string_const("archive.formattag", &config_value);
+	if (!config_value) {
+		strbuf_addstr(out, DEFAULT_FORMAT_TAG);
+		return;
+	}
+
+	strbuf_addstr(out, config_value);
+	if (out->len == 0) {
+		strbuf_addstr(out, DEFAULT_FORMAT_TAG);
+		return;
+	}
+}
+
+void get_default_format_string(struct strbuf *out)
+{
+	const char *config_value = NULL;
+	git_config_get_string_const("archive.formatstring", &config_value);
+	if (!config_value) {
+		strbuf_addstr(out, DEFAULT_FORMAT_STRING);
+		return;
+	}
+
+	strbuf_addstr(out, config_value);
+	if (out->len == 0) {
+		strbuf_addstr(out, DEFAULT_FORMAT_STRING);
+		return;
+	}
+}
+
 static void format_subst(const struct commit *commit,
 			 const char *src, size_t len,
 			 struct strbuf *buf)
@@ -45,27 +85,41 @@ static void format_subst(const struct commit *commit,
 	ctx.date_mode.type = DATE_NORMAL;
 	ctx.abbrev = DEFAULT_ABBREV;
 
+	struct strbuf format_tag_buf = STRBUF_INIT;
+	get_format_tag(&format_tag_buf);
+
+	struct strbuf default_format_string_buf = STRBUF_INIT;
+	get_default_format_string(&default_format_string_buf);
+
 	if (src == buf->buf)
 		to_free = strbuf_detach(buf, NULL);
 	for (;;) {
 		const char *b, *c;
 
-		b = memmem(src, len, "$Format:", 8);
+		b = memmem(src, len, format_tag_buf.buf, format_tag_buf.len);
 		if (!b)
 			break;
-		c = memchr(b + 8, '$', (src + len) - b - 8);
+		c = memchr(b + format_tag_buf.len, '$', (src + len) - b - format_tag_buf.len);
 		if (!c)
 			break;
 
 		strbuf_reset(&fmt);
-		strbuf_add(&fmt, b + 8, c - b - 8);
+		strbuf_add(&fmt, b + format_tag_buf.len, c - b - format_tag_buf.len);
 
 		strbuf_add(buf, src, b - src);
-		format_commit_message(commit, fmt.buf, buf, &ctx);
+
+		if (fmt.len == 0) {
+			format_commit_message(commit, default_format_string_buf.buf, buf, &ctx);
+		} else {
+			format_commit_message(commit, fmt.buf, buf, &ctx);
+		}
+
 		len -= c + 1 - src;
 		src  = c + 1;
 	}
 	strbuf_add(buf, src, len);
+	strbuf_release(&default_format_string_buf);
+	strbuf_release(&format_tag_buf);
 	strbuf_release(&fmt);
 	free(to_free);
 }
