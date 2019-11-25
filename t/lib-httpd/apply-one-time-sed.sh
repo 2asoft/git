@@ -7,11 +7,13 @@
 #
 # This can be used to simulate the effects of the repository changing in
 # between HTTP request-response pairs.
-if [ -e one-time-sed ]; then
+if test -e one-time-sed
+then
 	"$GIT_EXEC_PATH/git-http-backend" >out
-	sed "$(cat one-time-sed)" <out >out_modified
+	sed "$(cat one-time-sed)" out >out_modified
 
-	if diff out out_modified >/dev/null; then
+	if diff out out_modified >/dev/null
+	then
 		cat out
 	else
 		cat out_modified
