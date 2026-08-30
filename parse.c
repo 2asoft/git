@@ -143,6 +143,48 @@ int git_parse_size_t(const char *value, size_t *ret)
 	return 1;
 }
 
+int git_parse_duration(const char *value, timestamp_t *ret)
+{
+	char *end;
+	uintmax_t value_as_uint;
+	uintmax_t multiplier = 1;
+
+	if (!value || !*value || strchr(value, '-')) {
+		errno = EINVAL;
+		return 0;
+	}
+
+	errno = 0;
+	value_as_uint = strtoumax(value, &end, 10);
+	if (errno == ERANGE || end == value)
+		return 0;
+
+	if (*end) {
+		if (!strcmp(end, "s"))
+			multiplier = 1;
+		else if (!strcmp(end, "m"))
+			multiplier = 60;
+		else if (!strcmp(end, "h"))
+			multiplier = 60 * 60;
+		else if (!strcmp(end, "d"))
+			multiplier = 24 * 60 * 60;
+		else if (!strcmp(end, "w"))
+			multiplier = 7 * 24 * 60 * 60;
+		else {
+			errno = EINVAL;
+			return 0;
+		}
+	}
+
+	if (unsigned_mult_overflows(value_as_uint, multiplier)) {
+		errno = ERANGE;
+		return 0;
+	}
+
+	*ret = value_as_uint * multiplier;
+	return 1;
+}
+
 int git_parse_double(const char *value, double *ret)
 {
 	char *end;

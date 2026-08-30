@@ -11,6 +11,12 @@ int git_parse_int(const char *value, int *ret);
 int git_parse_int64(const char *value, int64_t *ret);
 int git_parse_double(const char *value, double *ret);
 
+/*
+ * Parse an unsigned duration with an optional suffix of "s", "m", "h", "d",
+ * or "w". Values without a suffix are seconds.
+ */
+int git_parse_duration(const char *value, timestamp_t *ret);
+
 /**
  * Same as `git_config_bool`, except that it returns -1 on error rather
  * than dying.

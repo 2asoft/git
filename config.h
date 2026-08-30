@@ -292,6 +292,9 @@ size_t git_config_size_t(const char *, const char *,
 double git_config_double(const char *, const char *,
 			 const struct key_value_info *);
 
+timestamp_t git_config_duration(const char *, const char *,
+				const struct key_value_info *);
+
 /**
  * Same as `git_config_bool`, except that integers are returned as-is, and
  * an `is_bool` flag is unset.

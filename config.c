@@ -1289,6 +1289,16 @@ double git_config_double(const char *name, const char *value,
 	return ret;
 }
 
+timestamp_t git_config_duration(const char *name, const char *value,
+				const struct key_value_info *kvi)
+{
+	timestamp_t ret;
+
+	if (!git_parse_duration(value, &ret))
+		die_bad_number(name, value, kvi);
+	return ret;
+}
+
 int git_config_bool_or_int(const char *name, const char *value,
 			   const struct key_value_info *kvi, int *is_bool)
 {
