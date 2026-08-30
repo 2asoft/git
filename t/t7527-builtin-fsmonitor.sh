@@ -121,6 +121,38 @@ start_daemon () {
 	)
 }
 
+idle_sleep () {
+	perl -e "select undef, undef, undef, shift" "$1"
+}
+
+wait_for_idle_shutdown () {
+	r=$1 &&
+	for i in $(test_seq 1 80)
+	do
+		test_must_fail git -C "$r" fsmonitor--daemon status && return 0
+		idle_sleep 0.025
+	done &&
+	return 1
+}
+
+start_idle_daemon () {
+	test_env GIT_TEST_FSMONITOR_IDLE_TIMEOUT_MSEC=200 \
+		start_daemon "$@"
+}
+
+wait_for_trace_count () {
+	count=$1 &&
+	pattern=$2 &&
+	trace=$3 &&
+	for i in $(test_seq 1 40)
+	do
+		test "$(grep -c "$pattern" "$trace" 2>/dev/null || :)" -ge "$count" &&
+			return 0
+		idle_sleep 0.025
+	done &&
+	return 1
+}
+
 # Is a Trace2 data event present with the given catetory and key?
 # We do not care what the value is.
 #
@@ -130,6 +162,100 @@ have_t2_data_event () {
 
 	grep -e '"event":"data".*"category":"'"$c"'".*"key":"'"$k"'"'
 }
+
+test_expect_success PERL 'idle timeout is disabled when unset or zero' '
+	test_when_finished "stop_daemon_delete_repo test_idle_disabled" &&
+
+	git init test_idle_disabled &&
+	start_daemon -C test_idle_disabled &&
+	idle_sleep 0.3 &&
+	git -C test_idle_disabled fsmonitor--daemon status &&
+	git -C test_idle_disabled config fsmonitor.idleTimeout 0 &&
+	git -C test_idle_disabled fsmonitor--daemon stop &&
+	start_daemon -C test_idle_disabled &&
+	idle_sleep 0.3 &&
+	git -C test_idle_disabled fsmonitor--daemon status &&
+	git -C test_idle_disabled fsmonitor--daemon stop &&
+	git -C test_idle_disabled config fsmonitor.idleTimeout 30m &&
+	start_daemon -C test_idle_disabled &&
+	git -C test_idle_disabled fsmonitor--daemon stop &&
+	test_must_fail git -C test_idle_disabled \
+		-c fsmonitor.idleTimeout fsmonitor--daemon start &&
+	test_must_fail git -C test_idle_disabled \
+		-c fsmonitor.idleTimeout=-1s fsmonitor--daemon start &&
+	test_must_fail git -C test_idle_disabled \
+		-c fsmonitor.idleTimeout=18446744073709551615m \
+		fsmonitor--daemon start &&
+	test_must_fail git -C test_idle_disabled \
+		-c fsmonitor.idleTimeout=9223372036854775808 \
+		fsmonitor--daemon start
+'
+
+test_expect_success PERL 'idle timeout stops daemon and a request resets it' '
+	test_when_finished "stop_daemon_delete_repo test_idle_timeout" &&
+
+	git init test_idle_timeout &&
+	start_idle_daemon -C test_idle_timeout &&
+	idle_sleep 0.1 &&
+	test-tool -C test_idle_timeout fsmonitor-client query --token 0 &&
+	idle_sleep 0.1 &&
+	git -C test_idle_timeout fsmonitor--daemon status &&
+	wait_for_idle_shutdown test_idle_timeout
+'
+
+test_expect_success PERL 'filesystem activity does not reset idle timeout' '
+	test_when_finished "stop_daemon_delete_repo test_idle_filesystem" &&
+
+	git init test_idle_filesystem &&
+	start_idle_daemon -C test_idle_filesystem &&
+	for i in $(test_seq 1 10)
+	do
+		echo "$i" >test_idle_filesystem/file &&
+		idle_sleep 0.025 || return 1
+	done &&
+	wait_for_idle_shutdown test_idle_filesystem
+'
+
+test_expect_success PERL 'idle daemon restarts for a subsequent Git command' '
+	test_when_finished "stop_daemon_delete_repo test_idle_restart" &&
+
+	git init test_idle_restart &&
+	git -C test_idle_restart config core.fsmonitor true &&
+	start_idle_daemon -C test_idle_restart &&
+	git -C test_idle_restart update-index --fsmonitor &&
+	wait_for_idle_shutdown test_idle_restart &&
+	git -C test_idle_restart status &&
+	git -C test_idle_restart fsmonitor--daemon status
+'
+
+test_expect_success PERL 'explicit stop joins idle thread' '
+	test_when_finished "stop_daemon_delete_repo test_idle_stop" &&
+
+	git init test_idle_stop &&
+	start_idle_daemon -C test_idle_stop &&
+	git -C test_idle_stop fsmonitor--daemon stop &&
+	test_must_fail git -C test_idle_stop fsmonitor--daemon status
+'
+
+test_expect_success PERL 'concurrent clients prevent idle shutdown' '
+	test_when_finished "stop_daemon_delete_repo test_idle_concurrent" &&
+
+	git init test_idle_concurrent &&
+	test_env GIT_TEST_FSMONITOR_IDLE_TIMEOUT_MSEC=200 \
+		GIT_TEST_FSMONITOR_CLIENT_DELAY_MSEC=400 \
+		start_daemon -C test_idle_concurrent \
+			--tf "$PWD/idle-concurrent.trace" &&
+	{
+		test-tool -C test_idle_concurrent fsmonitor-client hammer \
+			--token 0 --threads 4 --requests 1 &
+		hammer_pid=$!
+	} &&
+	wait_for_trace_count 4 "requested token" idle-concurrent.trace &&
+	idle_sleep 0.25 &&
+	git -C test_idle_concurrent fsmonitor--daemon status &&
+	wait "$hammer_pid" &&
+	wait_for_idle_shutdown test_idle_concurrent
+'
 
 test_expect_success 'explicit daemon start and stop' '
 	test_when_finished "stop_daemon_delete_repo test_explicit" &&

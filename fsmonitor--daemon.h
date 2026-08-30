@@ -37,7 +37,16 @@ struct fsm_health_data; /* opaque platform-specific data for health thread */
 struct fsmonitor_daemon_state {
 	pthread_t listener_thread;
 	pthread_t health_thread;
+	pthread_t idle_thread;
 	pthread_mutex_t main_lock;
+	pthread_cond_t idle_cond;
+
+	timestamp_t idle_timeout_sec;
+	uint64_t last_client_activity_ns;
+
+	unsigned int active_clients;
+	unsigned int idle_thread_started : 1;
+	unsigned int idle_shutdown : 1;
 
 	struct strbuf path_worktree_watch;
 	struct strbuf path_gitdir_watch;

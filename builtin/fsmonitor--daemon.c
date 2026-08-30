@@ -8,6 +8,7 @@
 #include "environment.h"
 #include "gettext.h"
 #include "parse-options.h"
+#include "parse.h"
 #include "fsmonitor-ll.h"
 #include "fsmonitor-ipc.h"
 #include "fsmonitor-settings.h"
@@ -42,6 +43,21 @@ static int fsmonitor__start_timeout_sec = 60;
 #define FSMONITOR__ANNOUNCE_STARTUP "fsmonitor.announcestartup"
 static int fsmonitor__announce_startup = 0;
 
+#define FSMONITOR__IDLE_TIMEOUT "fsmonitor.idletimeout"
+static timestamp_t fsmonitor__idle_timeout_sec;
+
+static unsigned int fsmonitor__test_idle_timeout_msec;
+static unsigned int fsmonitor__test_client_delay_msec;
+
+static uint64_t fsmonitor_get_monotonic_time(void)
+{
+	uint64_t time;
+
+	if (get_monotonic_time(&time))
+		die(_("monotonic clock is not available"));
+	return time;
+}
+
 static int fsmonitor_config(const char *var, const char *value,
 			    const struct config_context *ctx, void *cb)
 {
@@ -60,6 +76,16 @@ static int fsmonitor_config(const char *var, const char *value,
 			return error(_("value of '%s' out of range: %d"),
 				     FSMONITOR__START_TIMEOUT, i);
 		fsmonitor__start_timeout_sec = i;
+		return 0;
+	}
+
+	if (!strcmp(var, FSMONITOR__IDLE_TIMEOUT)) {
+		timestamp_t timeout = git_config_duration(var, value, ctx->kvi);
+
+		if (timeout > maximum_signed_value_of_type(time_t))
+			return error(_("value of '%s' out of range: %" PRIuMAX),
+				     var, timeout);
+		fsmonitor__idle_timeout_sec = timeout;
 		return 0;
 	}
 
@@ -994,7 +1020,14 @@ static int handle_client(void *data,
 	if (command_len != strlen(command))
 		BUG("FSMonitor assumes text messages");
 
+	pthread_mutex_lock(&state->main_lock);
+	state->active_clients++;
+	pthread_cond_signal(&state->idle_cond);
+	pthread_mutex_unlock(&state->main_lock);
+
 	trace_printf_key(&trace_fsmonitor, "requested token: %s", command);
+	if (fsmonitor__test_client_delay_msec)
+		sleep_millisec(fsmonitor__test_client_delay_msec);
 
 	trace2_region_enter("fsmonitor", "handle_client", the_repository);
 	trace2_data_string("fsmonitor", the_repository, "request", command);
@@ -1002,6 +1035,13 @@ static int handle_client(void *data,
 	result = do_handle_client(state, command, reply, reply_data);
 
 	trace2_region_leave("fsmonitor", "handle_client", the_repository);
+
+	pthread_mutex_lock(&state->main_lock);
+	assert(state->active_clients);
+	state->active_clients--;
+	state->last_client_activity_ns = fsmonitor_get_monotonic_time();
+	pthread_cond_signal(&state->idle_cond);
+	pthread_mutex_unlock(&state->main_lock);
 
 	return result;
 }
@@ -1204,6 +1244,80 @@ static void *fsm_listen__thread_proc(void *_state)
 	return NULL;
 }
 
+static uint64_t fsmonitor_idle_timeout_ns(
+	struct fsmonitor_daemon_state *state)
+{
+	if (fsmonitor__test_idle_timeout_msec)
+		return (uint64_t)fsmonitor__test_idle_timeout_msec * 1000000;
+	if (state->idle_timeout_sec > UINT64_MAX / 1000000000)
+		return UINT64_MAX;
+	return state->idle_timeout_sec * 1000000000;
+}
+
+static uint64_t fsmonitor_idle_deadline(
+	struct fsmonitor_daemon_state *state)
+{
+	uint64_t timeout_ns = fsmonitor_idle_timeout_ns(state);
+
+	if (timeout_ns > UINT64_MAX - state->last_client_activity_ns)
+		return UINT64_MAX;
+	return state->last_client_activity_ns + timeout_ns;
+}
+
+static void *fsmonitor_idle_thread_proc(void *data)
+{
+	struct fsmonitor_daemon_state *state = data;
+
+	trace2_thread_start("fsm_idle");
+
+	pthread_mutex_lock(&state->main_lock);
+	for (;;) {
+		uint64_t deadline;
+		uint64_t now;
+		int ret;
+
+		if (state->idle_shutdown)
+			break;
+
+		if (state->active_clients) {
+			pthread_cond_wait(&state->idle_cond, &state->main_lock);
+			continue;
+		}
+
+		deadline = fsmonitor_idle_deadline(state);
+		now = fsmonitor_get_monotonic_time();
+		if (now >= deadline) {
+			state->idle_shutdown = 1;
+			pthread_mutex_unlock(&state->main_lock);
+
+			trace_printf_key(&trace_fsmonitor,
+					 "stopping after idle timeout");
+			trace2_data_intmax("fsmonitor", the_repository,
+					   "idle_timeout_sec",
+					   state->idle_timeout_sec);
+			ipc_server_stop_async(state->ipc_server_data);
+
+			trace2_thread_exit();
+			return NULL;
+		}
+
+		ret = monotonic_cond_timedwait(&state->idle_cond,
+					       &state->main_lock, deadline - now);
+		if (ret && ret != ETIMEDOUT) {
+			state->idle_shutdown = 1;
+			pthread_mutex_unlock(&state->main_lock);
+			warning(_("fsmonitor idle wait failed: %s"), strerror(ret));
+			ipc_server_stop_async(state->ipc_server_data);
+			trace2_thread_exit();
+			return NULL;
+		}
+	}
+
+	pthread_mutex_unlock(&state->main_lock);
+	trace2_thread_exit();
+	return NULL;
+}
+
 static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 {
 	struct ipc_server_opts ipc_opts = {
@@ -1256,6 +1370,19 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	}
 	health_started = 1;
 
+	if (state->idle_timeout_sec || fsmonitor__test_idle_timeout_msec) {
+		pthread_mutex_lock(&state->main_lock);
+		state->last_client_activity_ns = fsmonitor_get_monotonic_time();
+		pthread_mutex_unlock(&state->main_lock);
+		if (pthread_create(&state->idle_thread, NULL,
+				   fsmonitor_idle_thread_proc, state)) {
+			ipc_server_stop_async(state->ipc_server_data);
+			err = error(_("could not start fsmonitor idle thread"));
+			goto cleanup;
+		}
+		state->idle_thread_started = 1;
+	}
+
 	/*
 	 * The daemon is now fully functional in background threads.
 	 * Our primary thread should now just wait while the threads
@@ -1267,6 +1394,14 @@ cleanup:
 	 * request, from filesystem activity, or an error).
 	 */
 	ipc_server_await(state->ipc_server_data);
+
+	if (state->idle_thread_started) {
+		pthread_mutex_lock(&state->main_lock);
+		state->idle_shutdown = 1;
+		pthread_cond_signal(&state->idle_cond);
+		pthread_mutex_unlock(&state->main_lock);
+		pthread_join(state->idle_thread, NULL);
+	}
 
 	/*
 	 * The fsmonitor listener thread may have received a shutdown
@@ -1303,6 +1438,15 @@ static int fsmonitor_run_daemon(void)
 	hashmap_init(&state.cookies, cookies_cmp, NULL, 0);
 	pthread_mutex_init(&state.main_lock, NULL);
 	pthread_cond_init(&state.cookies_cond, NULL);
+	{
+		int ret = init_monotonic_cond(&state.idle_cond);
+
+		if (ret)
+			die(_("could not initialize fsmonitor idle condition: %s"),
+			    strerror(ret));
+	}
+	state.idle_timeout_sec = fsmonitor__idle_timeout_sec;
+	state.last_client_activity_ns = fsmonitor_get_monotonic_time();
 	state.listen_error_code = 0;
 	state.health_error_code = 0;
 	state.current_token_data = fsmonitor_new_token_data();
@@ -1421,6 +1565,7 @@ done:
 	fsmonitor_free_token_data(state.current_token_data);
 	state.current_token_data = NULL;
 	pthread_cond_destroy(&state.cookies_cond);
+	pthread_cond_destroy(&state.idle_cond);
 	pthread_mutex_destroy(&state.main_lock);
 	{
 		struct hashmap_iter iter;
@@ -1587,6 +1732,20 @@ int cmd_fsmonitor__daemon(int argc,
 	};
 
 	repo_config(the_repository, fsmonitor_config, NULL);
+
+	{
+		const char *idle = getenv("GIT_TEST_FSMONITOR_IDLE_TIMEOUT_MSEC");
+		const char *delay = getenv("GIT_TEST_FSMONITOR_CLIENT_DELAY_MSEC");
+
+		if (idle && !git_parse_uint(idle,
+					    &fsmonitor__test_idle_timeout_msec))
+			die(_("invalid GIT_TEST_FSMONITOR_IDLE_TIMEOUT_MSEC value '%s'"),
+			    idle);
+		if (delay && !git_parse_uint(delay,
+					     &fsmonitor__test_client_delay_msec))
+			die(_("invalid GIT_TEST_FSMONITOR_CLIENT_DELAY_MSEC value '%s'"),
+			    delay);
+	}
 
 	argc = parse_options(argc, argv, prefix, options,
 			     builtin_fsmonitor__daemon_usage, 0);

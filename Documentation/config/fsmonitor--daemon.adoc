@@ -3,6 +3,15 @@ fsmonitor.allowRemote::
     repositories. Setting `fsmonitor.allowRemote` to `true` overrides this
     behavior.  Only respected when `core.fsmonitor` is set to `true`.
 
+fsmonitor.idleTimeout::
+    Specifies how long the built-in filesystem-monitor daemon may remain
+    without completing an IPC client request before terminating. Filesystem
+    events do not reset this timeout. When `core.fsmonitor` is `true`, a
+    subsequent Git command restarts the daemon automatically. Zero disables
+    automatic idle termination. The value is an unsigned integer followed
+    optionally by a lowercase `s` (seconds), `m` (minutes), `h` (hours), `d`
+    (days), or `w` (weeks); without a suffix, it is in seconds.
+
 fsmonitor.socketDir::
     This Mac OS and Linux-specific option, if set, specifies the directory in
     which to create the Unix domain socket used for communication
