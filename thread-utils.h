@@ -51,7 +51,14 @@ int dummy_pthread_init(void *);
 #endif
 
 int online_cpus(void);
-int init_recursive_mutex(pthread_mutex_t*);
+int init_recursive_mutex(pthread_mutex_t *);
 
+/*
+ * Initialize a condition variable and wait for a relative duration measured
+ * against a monotonic clock.
+ */
+int init_monotonic_cond(pthread_cond_t *cond);
+int monotonic_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+			     uint64_t timeout_ns);
 
 #endif /* THREAD_COMPAT_H */

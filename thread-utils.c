@@ -65,6 +65,94 @@ int online_cpus(void)
 #endif
 }
 
+int init_monotonic_cond(pthread_cond_t *cond)
+{
+#ifdef NO_PTHREADS
+	return ENOSYS;
+#elif defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_MONOTONIC) && \
+	!defined(GIT_WINDOWS_NATIVE) && !defined(__APPLE__)
+	pthread_condattr_t attr;
+	int ret;
+
+	ret = pthread_condattr_init(&attr);
+	if (!ret) {
+		ret = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+		if (!ret)
+			ret = pthread_cond_init(cond, &attr);
+		pthread_condattr_destroy(&attr);
+	}
+	return ret;
+#else
+	return pthread_cond_init(cond, NULL);
+#endif
+}
+
+#if !defined(NO_PTHREADS) && !defined(GIT_WINDOWS_NATIVE)
+static void timespec_add_nanoseconds(struct timespec *ts, uint64_t nanoseconds)
+{
+	time_t max_seconds = maximum_signed_value_of_type(time_t);
+	uint64_t seconds = nanoseconds / 1000000000;
+
+	if (seconds > (uintmax_t)max_seconds - (uintmax_t)ts->tv_sec) {
+		ts->tv_sec = max_seconds;
+		ts->tv_nsec = 999999999;
+		return;
+	}
+
+	ts->tv_sec += seconds;
+	ts->tv_nsec += nanoseconds % 1000000000;
+	if (ts->tv_nsec >= 1000000000) {
+		if (ts->tv_sec == max_seconds)
+			ts->tv_nsec = 999999999;
+		else {
+			ts->tv_sec++;
+			ts->tv_nsec -= 1000000000;
+		}
+	}
+}
+#endif
+
+int monotonic_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+			     uint64_t timeout_ns)
+{
+#ifdef NO_PTHREADS
+	return ENOSYS;
+#elif defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_MONOTONIC) && \
+	!defined(GIT_WINDOWS_NATIVE) && !defined(__APPLE__)
+	struct timespec deadline;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &deadline))
+		return errno;
+	timespec_add_nanoseconds(&deadline, timeout_ns);
+	return pthread_cond_timedwait(cond, mutex, &deadline);
+#elif defined(GIT_WINDOWS_NATIVE)
+	uint64_t timeout_ms = timeout_ns / 1000000;
+	DWORD timeout;
+
+	if (timeout_ns % 1000000)
+		timeout_ms++;
+	if (timeout_ms >= INFINITE)
+		timeout = INFINITE - 1;
+	else
+		timeout = (DWORD)timeout_ms;
+	if (!SleepConditionVariableCS(cond, mutex, timeout)) {
+		DWORD err = GetLastError();
+
+		if (err == ERROR_TIMEOUT)
+			return ETIMEDOUT;
+		return err_win_to_posix(err);
+	}
+	return 0;
+#elif defined(__APPLE__)
+	struct timespec timeout = { 0 };
+
+	timespec_add_nanoseconds(&timeout, timeout_ns);
+	return pthread_cond_timedwait_relative_np(cond, mutex, &timeout);
+#else
+	return ENOSYS;
+#endif
+}
+
 int init_recursive_mutex(pthread_mutex_t *m)
 {
 #ifndef NO_PTHREADS
