@@ -117,11 +117,18 @@ void trace_disable(struct trace_key *key);
 /**
  * Returns nanoseconds since the epoch (01/01/1970), typically used
  * for performance measurements.
- * Currently there are high precision timer implementations for Linux (using
- * `clock_gettime(CLOCK_MONOTONIC)`) and Windows (`QueryPerformanceCounter`).
- * Other platforms use `gettimeofday` as time source.
+ * Currently there are high precision timer implementations for platforms with
+ * `clock_gettime(CLOCK_MONOTONIC)`, Windows (`QueryPerformanceCounter`), and
+ * macOS (`mach_absolute_time`). Other platforms use `gettimeofday` as time
+ * source.
  */
 uint64_t getnanotime(void);
+
+/**
+ * Read a monotonic clock into `time`, in nanoseconds. Returns 0 on success and
+ * -1 when no monotonic clock is available.
+ */
+int get_monotonic_time(uint64_t *time);
 
 void trace_command_performance(const char **argv);
 void trace_verbatim(struct trace_key *key, const void *buf, unsigned len);

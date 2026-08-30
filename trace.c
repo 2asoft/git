@@ -30,6 +30,10 @@
 #include "setup.h"
 #include "trace.h"
 
+#ifdef __APPLE__
+# include <mach/mach_time.h>
+#endif
+
 struct trace_key trace_default_key = { "GIT_TRACE", 0, 0, 0 };
 struct trace_key trace_perf_key = TRACE_KEY_INIT(PERFORMANCE);
 struct trace_key trace_setup_key = TRACE_KEY_INIT(SETUP);
@@ -329,17 +333,19 @@ int trace_want(struct trace_key *key)
 
 #if defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_MONOTONIC)
 
-static inline uint64_t highres_nanos(void)
+static inline int highres_nanos(uint64_t *nanos)
 {
 	struct timespec ts;
+
 	if (clock_gettime(CLOCK_MONOTONIC, &ts))
-		return 0;
-	return (uint64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+		return -1;
+	*nanos = (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+	return 0;
 }
 
 #elif defined (GIT_WINDOWS_NATIVE)
 
-static inline uint64_t highres_nanos(void)
+static inline int highres_nanos(uint64_t *nanos)
 {
 	static uint64_t high_ns, scaled_low_ns;
 	static int scale;
@@ -347,7 +353,7 @@ static inline uint64_t highres_nanos(void)
 
 	if (!scale) {
 		if (!QueryPerformanceFrequency(&cnt))
-			return 0;
+			return -1;
 
 		/* high_ns = number of ns per cnt.HighPart */
 		high_ns = (1000000000LL << 32) / (uint64_t) cnt.QuadPart;
@@ -366,15 +372,37 @@ static inline uint64_t highres_nanos(void)
 		}
 	}
 
-	/* if QPF worked on initialization, we expect QPC to work as well */
-	QueryPerformanceCounter(&cnt);
+	if (!QueryPerformanceCounter(&cnt))
+		return -1;
 
-	return (high_ns * cnt.HighPart) +
-	       ((scaled_low_ns * cnt.LowPart) >> scale);
+	*nanos = (high_ns * cnt.HighPart) +
+		 ((scaled_low_ns * cnt.LowPart) >> scale);
+	return 0;
+}
+
+#elif defined(__APPLE__)
+
+static inline int highres_nanos(uint64_t *nanos)
+{
+	mach_timebase_info_data_t timebase;
+	uint64_t ticks = mach_absolute_time();
+
+	if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.denom)
+		return -1;
+	if (unsigned_mult_overflows(ticks / timebase.denom,
+				    timebase.numer))
+		return -1;
+	*nanos = ticks / timebase.denom * timebase.numer;
+	*nanos += ticks % timebase.denom * timebase.numer /
+		  timebase.denom;
+	return 0;
 }
 
 #else
-# define highres_nanos() 0
+static inline int highres_nanos(uint64_t *nanos UNUSED)
+{
+	return -1;
+}
 #endif
 
 static inline uint64_t gettimeofday_nanos(void)
@@ -384,6 +412,11 @@ static inline uint64_t gettimeofday_nanos(void)
 	return (uint64_t) tv.tv_sec * 1000000000 + tv.tv_usec * 1000;
 }
 
+int get_monotonic_time(uint64_t *time)
+{
+	return highres_nanos(time);
+}
+
 /*
  * Returns nanoseconds since the epoch (01/01/1970), for performance tracing
  * (i.e. favoring high precision over wall clock time accuracy).
@@ -391,17 +424,21 @@ static inline uint64_t gettimeofday_nanos(void)
 uint64_t getnanotime(void)
 {
 	static uint64_t offset;
+	uint64_t highres;
+
 	if (offset > 1) {
 		/* initialization succeeded, return offset + high res time */
-		return offset + highres_nanos();
+		if (!highres_nanos(&highres))
+			return offset + highres;
+		return gettimeofday_nanos();
 	} else if (offset == 1) {
 		/* initialization failed, fall back to gettimeofday */
 		return gettimeofday_nanos();
 	} else {
 		/* initialize offset if high resolution timer works */
 		uint64_t now = gettimeofday_nanos();
-		uint64_t highres = highres_nanos();
-		if (highres)
+
+		if (!highres_nanos(&highres))
 			offset = now - highres;
 		else
 			offset = 1;
